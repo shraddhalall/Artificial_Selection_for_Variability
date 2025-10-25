@@ -1,0 +1,1 @@
+For analyzing variability in clockwise vs counterclockwise circling bias in selected vs control populations. MATLAB script parses raw MARGO centroid data, R script models differences

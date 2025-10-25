@@ -1,0 +1,522 @@
+---
+title: "Differences in number of offspring and weight of male & female offspring in selected vs control populations"
+author: "slall"
+date: "2025-05-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,    # show code
+  warning = FALSE,
+  message = FALSE
+)
+knitr::opts_knit$set(root.dir = "E:/Selection/")
+
+options(contrasts = c("contr.treatment", "contr.poly"), digits = 3)
+
+library(glmmTMB)
+library(dplyr)
+library(emmeans)
+library(MASS)
+library(knitr)
+library(ggplot2)
+
+```
+
+### Variables in imported data:
+
+selection: 2 evolutionary treatment groups, control and selected
+
+block: 3 replicate lineages within each control group, that are blocked (VC1 and VS1 are one block, VC2 and VS2 are a second block etc..)
+
+response 1: num_offspring - number of adult offspring from 1 female at Gen 17 (mid-selection)
+
+relaxation: 2 methods of relaxation - with and without family structure (responses 2-4)
+
+response 2: num_offspring - number of adult offspring from 1 female at Gen 24 (post-selection) 
+response 3: f_weight - weight of average female adult offspring (mg) 
+response 4: m_weight - weight of average male adult offspring (mg)
+
+### Gen 17 counts
+
+```{r import data Gen 17}
+df <- read.csv("analysis_by_assay/Fecundity/counts_gen17.csv")
+```
+
+We are interested both in the mean and variance of number of offspring at Gen 17. Since it is count data, we use a negative binomial model
+
+```{r neg binom model for counts at Gen 17}
+mod1 <- glmmTMB(num_offspring ~ 1 + selection + 
+                  diag(0 + selection | block ), 
+                dispformula = ~ 1 + selection + 
+                  diag(0 + selection | block ), 
+                family = nbinom2(link = "log"),
+                data = df, REML = FALSE)
+summary(mod1)
+```
+
+Both the mean and dispersion are significantly different with selection. Selection reduces average fecundity, and increases the dispersion across individuals.
+
+We next use emmeans to estimate mean and dispersion, and parametric bootstrapping to estimate CV and CI for CVs
+
+```{r emmeans estimates for Gen 17 counts}
+#mean
+emm_mu = emmeans(mod1, ~ selection, type="response") ;
+
+cont_mu = contrast(emm_mu, 'revpairwise')
+
+plot(cont_mu)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_avg_fecundity_gen17') +
+  theme_bw()
+
+emm_mu_df <- as.data.frame(  
+  summary(emm_mu))
+
+#dispersion
+emm_phi = emmeans(mod1,~ selection, type="response", component = 'disp')
+summary(emm_phi)
+
+cont_disp = contrast(emm_phi,method='revpairwise')
+
+plot(cont_disp)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_disp_fecundity_gen17') +
+  theme_bw()
+```
+
+```{r estimating real-world variability}
+#Summary data storing
+sumdata <- df %>% 
+  distinct(selection)
+
+b <- unlist(fixef(mod1))
+
+#replace names of rows to match the format I get from V_all
+names(b) <- sub("^cond\\.",    "",       names(b))   # remove "cond."
+names(b) <- sub("^disp\\.",   "disp~",   names(b))   # replace "disp." with "disp~"
+
+V_all <- vcov(mod1, full = TRUE)
+
+V <- V_all[names(b), names(b)]
+
+# Build model matrices for mean & dispersion
+Xc    <- model.matrix( ~ 1 + selection, sumdata)
+Xd    <- model.matrix( ~ 1 + selection, sumdata)
+
+# Point estimates
+beta_c <- fixef(mod1)$cond
+beta_d <- fixef(mod1)$disp
+
+mu_hat  <- drop(exp( Xc %*% beta_c ))         # μ̂ₙ
+phi_hat <- drop(exp( Xd %*% beta_d ))         # φ̂ₙ
+sd_hat  <- sqrt(mu_hat + mu_hat^2/phi_hat)    # ŜDₙ
+
+# Parametric “bootstrap” from the joint Normal of (β_cond, β_disp)
+set.seed(301)
+nsim <- 2000
+b_sims <- mvrnorm(nsim, mu = b, Sigma = V)
+
+# split sims into conditional vs dispersion
+p_c <- length(beta_c)
+beta_c_sims <- b_sims[, 1:p_c, drop=FALSE]
+beta_d_sims <- b_sims[, (p_c+1):ncol(b_sims), drop=FALSE]
+
+# For each sim, compute sd for every row of newdata
+sd_sims <- array(NA, dim = c(nrow(sumdata), nsim))
+mu_sims <- array(NA, dim = c(nrow(sumdata), nsim))
+
+for(i in seq_len(nsim)) {
+  mu_i  <- exp( Xc %*% beta_c_sims[i, ] )
+  phi_i <- exp( Xd %*% beta_d_sims[i, ] )
+  mu_sims[, i] <- mu_i  
+  sd_sims[, i] <- sqrt( mu_i + mu_i^2/phi_i )
+}
+
+cv_sims <- sd_sims / mu_sims
+cv_hat  <- sd_hat / mu_hat
+
+# Summarize into point‐est + 95% CI
+cv_ci <- t(apply(cv_sims, 1, quantile, probs = c(0.025, 0.975)))
+
+cv_df <- sumdata %>%
+  mutate( cv       = cv_hat,
+          cv_lower   = cv_ci[,1],
+          cv_upper  = cv_ci[,2])
+
+# Combine mean and CV estimates:
+emm_mu_df2 <- emm_mu_df %>%
+  dplyr::rename(
+    mu       = response,
+    mu_lower = `asymp.LCL`,
+    mu_upper = `asymp.UCL`
+  ) %>%
+  dplyr::select(
+    selection,
+    mu, mu_lower, mu_upper
+  )
+
+est_mat <- emm_mu_df2 %>%
+  left_join(cv_df, by = c("selection"))
+
+```
+
+```{r plots of estimates, echo = FALSE}
+
+#mean plot
+ggplot(est_mat, aes(x = selection, y = mu)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = mu_lower, ymax = mu_upper),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated Mean of Fecundity at Gen 17 by Group",
+    x = "Selection Regime",
+    y = "Mean (μ)",
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#var plot
+
+ggplot(est_mat, aes(x = selection, y = cv)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = cv_lower, ymax = cv_upper),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated Total Variability (CV) of fecundity at Gen 17 by Group",
+    x = "Selection Regime",
+    y = "Total CV = SD/Mean = sqrt(μ + μ² / ϕ)/μ",
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+**Takeaway: At Gen 17, selected populations had lower average fecundity and higher variability in the number of offspring produced by each female fly**
+
+### Gen 24 Counts
+
+Next, we compare mean and variability in number of offspring at Gen 24 (after selection and relaxation)
+
+```{r import data Gen 24}
+df <- read.csv("analysis_by_assay/Fecundity/fecundity_data.csv")
+```
+
+```{r neg binom model for counts at Gen 24}
+mod2 <- glmmTMB(num_offspring ~ 1 + selection*relaxation + 
+                  diag(0 + selection | block ), 
+                dispformula = ~ 1 + selection*relaxation + 
+                  diag(0 + selection | block ),
+                family = nbinom2(link = "log"),
+                data = df, REML = FALSE)
+summary(mod2)
+```
+
+For mean fecundity, selection is marginally significant while relaxation is significant. For dispersion, selection, relaxation and their interaction are all significant. We can use emmeans to break this down further.
+
+```{r emmeans for counts gen 24}
+#Mean
+emm_mu <- emmeans(mod2, ~ selection*relaxation, type = "response")
+
+cont_mu_rel = contrast(emm_mu, by = 'selection', 'revpairwise')
+summary(cont_mu_rel)
+plot(cont_mu_rel)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_mean_fecundity_gen24_by_relaxation') +
+  theme_bw()
+
+cont_mu_sel = contrast(emm_mu, by = 'relaxation', 'revpairwise')
+summary(cont_mu_sel)
+plot(cont_mu_sel)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_mean_fecundity_gen24_by_selection') +
+  theme_bw()
+
+#Dispersion
+#Remember: Lower disp parameter estimate -> Higher variability
+
+emm_disp <- emmeans(mod2, ~selection*relaxation, type = 'response', component = 'disp')
+
+cont_disp_rel = contrast(emm_disp, by = 'selection', 'revpairwise')
+summary(cont_disp_rel)
+plot(cont_disp_rel)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_disp_fecundity_gen24_by_relaxation') +
+  theme_bw()
+
+cont_disp_sel = contrast(emm_disp, by = 'relaxation', 'revpairwise')
+
+summary(cont_disp_sel)
+plot(cont_disp_sel)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_disp_fecundity_gen24_by_selection') +
+  theme_bw()
+
+
+```
+
+-   Relaxation doesn't impact fecundity in selected populations, but relaxing with family structure leads to, on average, higher number of offspring within control populations and a reduced variation in the number of offspring per female (since full disp \< fam disp --\> full variance \> fam variance)
+
+-   Selection doesn't impact mean fecundity with full relaxation, but when relaxed with family structure, selection continues to have slightly reduced fecundity than controls, similar in trend to Gen 17. It is marginally significant when evaluating the contrasts. Further, within family relaxed populations, selection leads to an increase in variance, as at Gen 17
+
+Next, we can use the computed parameters to estimate real world variability (CV) for fecundity at Gen 24
+
+```{r estimating real-world variability at Gen 24 for offspring counts}
+#Summary data storing
+sumdata <- df %>% 
+  distinct(selection,relaxation)
+
+# Extract fixed‐effect coefs & var–cov matrix
+b <- unlist(fixef(mod2))          
+V_full <- as.matrix(vcov(mod2, full = TRUE))
+
+names(b) <- ifelse(
+  startsWith(names(b), "cond."),
+  sub("^cond\\.", "", names(b)),            # drop the "cond." prefix
+  sub("^disp\\.", "disp~", names(b))         # replace "disp." with "disp~"
+)
+
+
+V <- V_full[names(b), names(b)]
+
+# Build model matrices for mean & dispersion
+Xc    <- model.matrix( ~ 1 + selection*relaxation, sumdata)
+Xd    <- model.matrix( ~ 1 + selection*relaxation, sumdata)
+
+# Point estimates
+beta_c <- fixef(mod2)$cond
+beta_d <- fixef(mod2)$disp
+
+mu_hat  <- drop(exp( Xc %*% beta_c ))         # μ̂ₙ
+phi_hat <- drop(exp( Xd %*% beta_d ))         # φ̂ₙ
+sd_hat  <- sqrt(mu_hat + mu_hat^2/phi_hat)    # ŜDₙ
+
+# Parametric “bootstrap” from the joint Normal of (β_cond, β_disp)
+set.seed(701)
+nsim <- 2000
+b_sims <- mvrnorm(nsim, mu = b, Sigma = V)
+
+# split sims into conditional vs dispersion
+p_c <- length(beta_c)
+beta_c_sims <- b_sims[, 1:p_c, drop=FALSE]
+beta_d_sims <- b_sims[, (p_c+1):ncol(b_sims), drop=FALSE]
+
+# For each sim, compute sd for every row of newdata
+sd_sims <- array(NA, dim = c(nrow(sumdata), nsim))
+mu_sims <- array(NA, dim = c(nrow(sumdata), nsim))
+
+for(i in seq_len(nsim)) {
+  mu_i  <- exp( Xc %*% beta_c_sims[i, ] )
+  phi_i <- exp( Xd %*% beta_d_sims[i, ] )
+  mu_sims[, i] <- mu_i  
+  sd_sims[, i] <- sqrt( mu_i + mu_i^2/phi_i )
+}
+
+cv_sims <- sd_sims / mu_sims
+cv_hat  <- sd_hat / mu_hat
+
+# Summarize into point‐est + 95% CI
+cv_ci <- t(apply(cv_sims, 1, quantile, probs = c(0.025, 0.975)))
+
+cv_df <- sumdata %>%
+  mutate( cv       = cv_hat,
+          cv_lower   = cv_ci[,1],
+          cv_upper  = cv_ci[,2])
+
+# Combine mean and CV estimates:
+emm_mu_df <- as.data.frame(  
+  summary(emm_mu))
+
+emm_mu_df2 <- emm_mu_df %>%
+  dplyr::rename(
+    mu       = response,
+    mu_lower = `asymp.LCL`,
+    mu_upper = `asymp.UCL`
+  ) %>%
+  dplyr::select(
+    selection,relaxation,
+    mu, mu_lower, mu_upper
+  )
+
+est_mat <- emm_mu_df2 %>%
+  left_join(cv_df, by = c("selection","relaxation"))
+
+```
+
+```{r plots of estimates for offspring counts Gen 24, echo = FALSE}
+
+#mean plot
+ggplot(est_mat, aes(x = relaxation, y = mu, color = selection)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = mu_lower, ymax = mu_upper),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated Mean Number of offspring by Group",
+    x = "Relaxation",
+    y = "Mean (μ)",
+    color = "Selection"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#var plot
+
+ggplot(est_mat, aes(x = relaxation, y = cv, color = selection)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = cv_lower, ymax = cv_upper),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated Total Variability (CV) of Number of offspring by Group",
+    x = "Relaxation",
+    y = "Total CV = SD/Mean = sqrt(μ + μ² / ϕ)/μ",
+    color = "Selection"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+**Takeaway: Full relaxation removes fecundity differences between control and selected populations. Within relaxation with family structure, selection reduces the average number of offspring and increases variation in opffspring counts**
+
+### Female offspring weight
+
+Each mothers's score is the average weight of a female offspring -> Total weight of all female offspring/Number of female offspring
+
+I'm not sure if Gamma is better here or Gaussian. I'm going to fit both and check LL - Gamma has a better likelihood, so I'm picking that. 
+
+```{r model for f_weight   }
+mod3 <- glmmTMB(f_weight ~ 1 + selection*relaxation + 
+                  diag(0 + selection | block ),
+                dispformula = ~ 1 + selection*relaxation +
+                  (1|block),
+                family = Gamma(link = "log"),
+                data = df, REML = FALSE)
+summary(mod3)
+
+```
+Selected females have higher weight of female offspring, marginally significant. Full relax have significantly smaller females. For dispersion, selection is marginally significant, as is the interaction between selection & relaxation. We can parse the differences with emmeans. 
+
+```{r emmeans for estimates of female weight}
+emm_mu = emmeans(mod3, ~selection*relaxation, type ='response')
+summary(emm_mu)
+
+mu_con = contrast(emm_mu,by = 'relaxation', 'revpairwise')
+summary(mu_con)
+
+plot(mu_con)
+
+emm_mu_df = as.data.frame(summary(emm_mu))
+
+emm_disp = emmeans(mod3, ~selection*relaxation, type ='response', component = 'disp')
+summary(emm_disp)
+
+disp_con = contrast(emm_disp,by = 'relaxation', 'revpairwise')
+summary(disp_con)
+```
+
+The dispersion analysis indicates broadly that relaxation method - and therefore inbreeding, are effecting selection & control variability differently. Fam relax selection females have lower variability than control, while full relax have higher variability than control. I'm not sure this is very interesting, and doesn't have a straightforward interpretation. So the next section plots only the mean estimates. 
+
+```{r plots of estimated f_weight, echo = FALSE}
+
+#mean plot
+ggplot(emm_mu_df, aes(x = relaxation, y = response, color = selection)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated average weight of female offspring",
+    x = "Relaxation",
+    y = "Mean (μ)",
+    color = "Selection"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+### Male offspring weight
+
+Each mothers's score is the average weight of a male offspring -> Total weight of all male offspring/Number of male offspring
+
+I'm not sure if Gamma is better here or Gaussian. I'm going to fit both and check LL - Gaussian has a better likelihood, so I could pick that, but the difference is small, and Gamma is good for consistency with female analysis. So I'm picking Gamma 
+
+```{r model for m_weight   }
+mod4 <- glmmTMB(m_weight ~ 1 + selection*relaxation + 
+                  diag(0 + selection | block ),
+                dispformula = ~ 1 + selection*relaxation +
+                  (1|block),
+                family = Gamma(link = "log"),
+                data = df, REML = FALSE)
+summary(mod4)
+
+```
+Selection does not change the average weight of male offspring. Relaxation does - again, full relax significantly smaller than fam relax. This makes sense -resource-wise, the mothers of the full relax spent time eating and growing in the full relax environment with more competition, whereas the fam relax ones grow in 1-mother vials.
+
+Everything including the interaction is significant for dispersion. 
+
+```{r emmeans for estimates of male weight}
+emm_mu = emmeans(mod4, ~selection*relaxation, type ='response')
+summary(emm_mu)
+
+mu_con = contrast(emm_mu,by = 'relaxation', 'revpairwise')
+summary(mu_con)
+
+plot(mu_con)
+
+emm_mu_df = as.data.frame(summary(emm_mu))
+
+emm_disp = emmeans(mod4, ~selection*relaxation, type ='response', component = 'disp')
+summary(emm_disp)
+
+disp_con = contrast(emm_disp,by = 'relaxation', 'revpairwise')
+summary(disp_con)
+```
+
+The dispersion analysis is the same pattern as in females. Fam relax selection males have lower variability than control, while full relax have higher variability than control. 
+
+I am not sure what to take from this,it is interesting but confusing.
+
+The plot below focuses on the mean.
+
+```{r plots of estimated m_weight, echo = FALSE}
+
+#mean plot
+ggplot(emm_mu_df, aes(x = relaxation, y = response, color = selection)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = asymp.LCL, ymax = asymp.UCL),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated average weight of male offspring",
+    x = "Relaxation",
+    y = "Mean (μ)",
+    color = "Selection"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+I am wondering about the brain size correlation. I'm going to filter the data for only block 3 and see if the trend is consistent there. 
+
+```{r subset Gen 24 data}
+df3 <- df[df$block == 3, ]
+```
+
+```{r Run female weight models on block 3 data}
+mod3f <- glmmTMB(f_weight ~ 1 + selection*relaxation,
+                family = Gamma(link = "log"),
+                data = df3, REML = FALSE)
+summary(mod3f)
+
+emm_3f = emmeans(mod3f,~selection*relaxation,type='response')
+summary(emm_3f)
+```
+
+```{r Run male weight models on block 3 data}
+mod3m <- glmmTMB(m_weight ~ 1 + selection*relaxation,
+                family = Gamma(link = "log"),
+                data = df3, REML = FALSE)
+summary(mod3m)
+
+emm_3f = emmeans(mod3f,~selection*relaxation,type='response')
+summary(emm_3f)
+```
+Not much to takeaway, the trend is not significant for females and non-existent for males in block 3

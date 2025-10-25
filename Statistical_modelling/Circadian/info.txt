@@ -1,0 +1,1 @@
+Analysis of circadian activity data measured over 72 hours, comparing locomotory activity patterns of selection vs control flies. Order of scripts: matlab (for metadata extraction) --> Python (For calculating moving-window activity of individuals and storing data for modelling in R) --> R (modelling differences)

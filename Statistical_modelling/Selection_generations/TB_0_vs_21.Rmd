@@ -1,0 +1,580 @@
+---
+title: "Ancestor(Gen 0) vs Control (Gen 21) vs Selection (Gen 21); Turn bias and Number of turns; Blockwise decomposition included"
+author: "slall"
+date: "2025-06-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,    # show code
+  warning = FALSE,
+  message = FALSE
+)
+knitr::opts_knit$set(root.dir = "E:/Selection/")
+
+options(contrasts = c("contr.treatment", "contr.poly"), digits = 3)
+
+library(glmmTMB)
+library(dplyr)
+library(emmeans)
+library(MASS)
+library(knitr)
+library(ggplot2)
+library(scales)
+
+```
+
+### Variables
+
+sex: 2 sexes
+
+block: 3 replicate lineages - 1,2,3 - separated into VS and VC
+
+pop: anc, sel or con - ancestral, selection, control
+
+date: multiple days of measurement, incomplete balanced blocking in general
+
+box: multiple behavioural boxes, with unique ids. 4 boxes.
+
+tray: unique ID of behavior tray used (Here: 1 to 10)
+
+arena_pos: position of behavior arena within the tray (Here: 1 to 64)
+
+unit of sampling is individual fly (i.e. you have unique, and INDEPENDENT measures of your response variables per fly.)
+
+response = TB - values between 0 and 1
+
+response = N - number of turns, mean and var
+
+###Turn-bias analysis
+
+```{r import + format data}
+df0 <- read.csv("analysis_by_assay/Generations_Ymaze/gen0_data.csv")
+df21 <- read.csv("analysis_by_assay/Generations_Ymaze/gen21.csv")
+
+df0$pop <- 'anc'
+df0$experimenter <- 'Shraddha'
+df21$family <- NULL
+
+names(df21)[names(df21) == 'selection'] <- 'pop'
+
+df <- rbind(df0,df21)
+
+df$block <- as.factor(df$block)
+df$R <- as.integer(round(df$N*df$TB)) #re-calculate num right turns from N and TB
+
+```
+
+```{r model TB as beta binomial}
+mod1 <- glmmTMB( cbind(R, N - R) ~ 1  + (pop*sex),
+                 
+                 #dispersion model
+                 
+                 dispformula = ~ 1 + (pop*sex) + 
+                   diag(0 + pop|block) +
+                 (1 | box)+ (1|tray) + (1|arena_pos) + (1|date) + (1|experimenter),
+                 family = betabinomial(link = "logit"),
+                 data = df, REML = FALSE)
+summary(mod1)
+
+```
+
+Selection is significant, as is selection x sex
+
+```{r means}
+
+emm_phi = emmeans(mod1, ~pop*sex, type="response", component = 'disp')
+
+pairs(emm_phi, by='sex')
+
+pairs(emm_phi, by='pop')
+
+cont2 = contrast(emm_phi, by = 'sex', method='revpairwise')
+
+summary(cont2)
+
+plot(cont2)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_disp_phi') +
+  theme_bw()
+
+```
+
+\*\*Takeaway: Control variability \> ancestor, marginally significant in males. Sel varaibility \>\> Con variability and Sel varaibility \>\> Con variability.
+
+Sex bias is very interesting here. F variability \> M variability always, but significantly in selection. So the selection is somehow causing an increased sexual dimorphism. The implications of this should be considered.\*\*\*
+
+```{r estimating variability in TB}
+# Build table of unique groups and the mean N for every pop x sex combination 
+
+group_df <- expand.grid(
+  pop = unique(df$pop),
+  sex       = unique(df$sex),
+  stringsAsFactors = FALSE
+) %>%
+  left_join(
+    df %>% group_by(pop, sex) %>% summarize(N_group = mean(N), .groups="drop"),
+    by = c("pop","sex")
+  )
+
+# Extract fixed‐effect MLEs & vcov’s
+beta_cond <- fixef(mod1)$cond #for conditional model = mean TB
+V_cond    <- vcov(mod1)$cond 
+
+beta_disp <- fixef(mod1)$disp #for dispersion model = phi
+V_disp    <- vcov(mod1)$disp
+
+# Model matrices for each group
+X_cond <- model.matrix(~ 1 + pop*sex, data = group_df)
+X_disp <- model.matrix(~ 1 + pop*sex, data = group_df)
+
+# Parametric bootstrap
+S <- 2000
+set.seed(2025)
+
+sim_cond <- mvrnorm(S, mu = beta_cond, Sigma = V_cond)
+sim_disp <- mvrnorm(S, mu = beta_disp, Sigma = V_disp)
+
+sd_fun <- function(mu, phi, N) sqrt((mu*(1 - mu)/N)*((N + phi)/(1 + phi)))
+
+groups <- group_df %>% distinct(pop, sex, N_group)
+G      <- nrow(groups)
+
+boot_sd <- matrix(NA, nrow = S, ncol = G)
+
+for(s in seq_len(S)) {
+  # full-table predictions
+  mu_full  <- plogis( X_cond %*% sim_cond[s, ] )
+  phi_full <- exp    ( X_disp %*% sim_disp[s, ] )
+  
+  # attach to group_df
+  tmp <- group_df %>%
+    mutate(mu = mu_full, phi = phi_full) %>%
+    # now marginalize over relaxation by averaging
+    group_by(pop, sex, N_group) %>%
+    summarize(
+      mu_marg  = mean(mu),
+      phi_marg = mean(phi),
+      .groups = "drop"
+    ) %>%
+    arrange(pop, sex)
+  
+  # compute sd for each group
+  boot_sd[s, ] <- sd_fun(tmp$mu_marg, tmp$phi_marg, tmp$N_group)
+}
+
+#Compute 95% CIs
+ci_mat <- apply(boot_sd, 2, quantile, probs = c(0.025, 0.975))
+
+ci_df <- groups %>%
+  arrange(pop, sex) %>%
+  mutate(
+    sd_est   = colMeans(boot_sd),
+    sd_lower = ci_mat[1, ],
+    sd_upper = ci_mat[2, ]
+  )
+```
+
+```{r plot, echo =FALSE}
+ggplot(ci_df, aes(x = pop, y = sd_est, color = sex)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(
+    aes(ymin = sd_lower, ymax = sd_upper),
+    width = 0.2,
+    position = position_dodge(width = 0.5)
+  ) +
+  labs(
+    title = "Estimated variability (σ) in TB before and at the end of selection",
+    x = "Population",
+    y = "Estimated variability in TB",
+    color = "Sex"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r plot 2, echo =FALSE}
+ggplot(ci_df, aes(x = sex, y = sd_est, color = pop)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(
+    aes(ymin = sd_lower, ymax = sd_upper),
+    width = 0.2,
+    position = position_dodge(width = 0.5)
+  ) +
+  labs(
+    title = "Estimated variability (σ) in TB before and at the end of selection",
+    x = "Sex",
+    y = "Estimated variability in TB",
+    color = "Population"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+### Block-wise differences - is the trend of variability in TB in ancestral vs final populations consistent across blocks?
+
+```{r model TB by block as beta binomial}
+mod1b <- glmmTMB( cbind(R, N - R) ~ 1  + (pop*sex*block),
+                 
+                 #dispersion model
+                 
+                 dispformula = ~ 1 + (pop*sex*block) + 
+                 (1 | box)+ (1|tray) + (1|arena_pos) + (1|date) + (1|experimenter),
+                 family = betabinomial(link = "logit"),
+                 data = df, REML = FALSE)
+
+summary(mod1b)
+
+```
+
+```{r block-wise means, marginalzizing sex}
+
+emm_phi = emmeans(mod1b, ~pop*block, type="response", component = 'disp')
+
+p1 = pairs(emm_phi, by='pop')
+p1
+
+p2 = pairs(emm_phi, by='block')
+p2
+
+plot(p2)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_disp_phi') +
+  theme_bw()
+
+contrasts_vs_block2 <- contrast(
+  emm_phi,
+  method = "trt.vs.ctrl",
+  ref    = 2,         # treat the 2nd level of `block` as the “control”
+  by     = "pop"
+)
+
+contrasts_vs_block2
+
+
+
+```
+
+-   **Block2** - Control variability is significantly higher than ancestor, marginally significant in block 3.
+-   In anc, block 2 variability sig \< 1 & 3, in sel as well. But in con, block 2 variability \> block 1 & 3
+
+```{r estimating variability}
+
+# Build table of unique groups and the mean N for every pop x sex x block combination 
+
+group_df <- expand.grid(
+  pop = unique(df$pop),
+  sex       = unique(df$sex),
+  block       = unique(df$block),
+  stringsAsFactors = FALSE
+) %>%
+  left_join(
+    df %>% group_by(pop, block) %>% summarize(N_group = mean(N), .groups="drop"),
+    by = c("pop","block")
+  )
+
+# Extract fixed‐effect MLEs & vcov’s
+beta_cond <- fixef(mod1b)$cond #for conditional model = mean TB
+V_cond    <- vcov(mod1b)$cond 
+
+beta_disp <- fixef(mod1b)$disp #for dispersion model = phi
+V_disp    <- vcov(mod1b)$disp
+
+# Model matrices for each group
+X_cond <- model.matrix(~ 1 + pop*sex*block, data = group_df)
+X_disp <- model.matrix(~ 1 + pop*sex*block, data = group_df)
+
+# Parametric bootstrap
+S <- 2000
+set.seed(2025)
+
+sim_cond <- mvrnorm(S, mu = beta_cond, Sigma = V_cond)
+sim_disp <- mvrnorm(S, mu = beta_disp, Sigma = V_disp)
+
+sd_fun <- function(mu, phi, N) sqrt((mu*(1 - mu)/N)*((N + phi)/(1 + phi)))
+
+groups <- group_df %>% distinct(pop, block, N_group)
+G      <- nrow(groups)
+
+boot_sd <- matrix(NA, nrow = S, ncol = G)
+
+for(s in seq_len(S)) {
+  # full-table predictions
+  mu_full  <- plogis( X_cond %*% sim_cond[s, ] )
+  phi_full <- exp    ( X_disp %*% sim_disp[s, ] )
+  
+  # attach to group_df
+  tmp <- group_df %>%
+    mutate(mu = mu_full, phi = phi_full) %>%
+    #marginalize out sex
+    group_by(pop, block, N_group) %>%
+    summarize(
+      mu_marg  = mean(mu),
+      phi_marg = mean(phi),
+      .groups = "drop"
+    ) %>%
+    arrange(pop, block)
+  
+  # compute sd for each group
+  boot_sd[s, ] <- sd_fun(tmp$mu_marg, tmp$phi_marg, tmp$N_group)
+}
+
+#Compute 95% CIs
+ci_mat <- apply(boot_sd, 2, quantile, probs = c(0.025, 0.975))
+
+ci_df <- groups %>%
+  arrange(pop, block) %>%
+  mutate(
+    sd_est   = colMeans(boot_sd),
+    sd_lower = ci_mat[1, ],
+    sd_upper = ci_mat[2, ]
+  )
+```
+
+```{r plot block-wise, echo =FALSE}
+ggplot(ci_df, aes(x = pop, y = sd_est, color = block)) +
+  geom_point(size = 3, position = position_dodge(width = 0.5)) +
+  geom_errorbar(
+    aes(ymin = sd_lower, ymax = sd_upper),
+    width = 0.2,
+    position = position_dodge(width = 0.5)
+  ) +
+  # 5) manual two colors
+  scale_color_manual(values = c(
+    '1' = "#2CB02B",
+    '2' = "#A82012",
+    '3' = "#4258BC"
+  )) +
+  labs(x     = "Population",
+       y     = "Estimated TB Variability ± 95% CI",
+       color = "Block"
+       ) +
+  # Format y-axis to 2 decimals
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  # Custom x-axis labels
+  scale_x_discrete(labels = c(
+    'anc' = 'Ancestral',
+    'sel' = 'Selection',
+    'con'   = 'Control'
+  )) +
+  theme_classic() +
+  theme(
+    panel.background = element_rect(fill = "transparent", colour = NA),
+    plot.background  = element_rect(fill = "transparent", colour = NA),
+    panel.border     = element_rect(colour = "black", fill = NA, linewidth = 1),
+    # Legend inside plot area
+    legend.position = "inside",
+    legend.position.inside = c(0.05, 0.95),  # new correct usage
+    legend.justification   = c(0, 1),
+    legend.background = element_rect(fill = "NA", color = 'black'),
+    axis.title.x = element_text(margin = margin(t = 10)),  # top margin for x-axis title
+    axis.title.y = element_text(margin = margin(r = 15))   # right margin for y-axis title
+)
+  
+ggsave("ancestral_vs_evolved_S4A.pdf",width = 7, height = 4, bg ='transparent')
+
+```
+
+### Estimating differences in N at gen 21 vs gen 0
+
+```{r modelling N across fams}
+mod2 <- glmmTMB( N ~ 1 + (pop*sex) + 
+                   diag(0 + pop|block)
+                 + (1 | date) + (1|box) + (1|tray) + (1|arena_pos),
+                 dispformula = ~ 1 + (pop*sex) + 
+                   diag(0 + pop|block)
+                 + (1 | date) +  (1|box) + (1|tray) + (1|arena_pos),
+                 family = nbinom2(link = "log"),
+                 data = df, REML = FALSE)
+
+
+
+summary(mod2)
+```
+
+**Results: Mean N is significant for pop, sex and interactions. Dispersion in N is significant for pop and interaction**
+
+```{r emmeans to estimate mean N and dispersion parameter}
+emm_mu = emmeans(mod2, ~ pop*sex, type="response")
+summary(emm_mu)
+
+pair1 = pairs(emm_mu, by = 'sex')
+summary(pair1)
+
+emm_mu2 = emmeans(mod2, ~ pop, type="response") #only by pop
+summary(emm_mu2)
+
+pair2 = pairs(emm_mu2)
+summary(pair2)
+
+plot(pair1)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('ratio_N_by_sex') +
+  theme_bw()
+
+
+emm_phi = emmeans(mod2,~ pop*sex, type="response", component = 'disp')
+
+pair_disp1 = contrast(emm_phi, by= 'sex',method='revpairwise')
+pair_disp2 = contrast(emm_phi, by= 'pop',method='revpairwise')
+
+summary(pair_disp1)
+summary(pair_disp2)
+
+plot(pair_disp1)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('Ratio_Disp_N_by_pop') +
+  theme_bw()
+
+
+plot(pair_disp2)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('Disp_N_by_sex') +
+  theme_bw()
+
+emm_phi2 = emmeans(mod2,~ pop, type="response", component = 'disp')
+
+pair_disp = contrast(emm_phi2, 'revpairwise')
+
+summary(pair_disp)
+
+plot(pair_disp)+
+geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('Ratio_Disp_N') +
+  theme_bw()
+```
+
+-   **Mean N** - anc \< con \< sel - but none of the comparisons are pairwise significant. F \< M in anc and sel, sig; F \> M in con, ns.
+
+-   **Disp N** - con and anc are ns, sel \< con sig, sel \< anc in variability sig (sel has higher phi) ; M vs F sig diff only in sel, with M var \> F var
+
+**Estimating real-world variance**
+
+We use the estimated values of mu and phi to estimate sd using negative binomial PDF
+
+```{r real-world variance}
+
+#Summary data storing
+sumdata <- df %>% 
+  distinct(pop, sex) %>% 
+  arrange(pop, sex)
+
+
+# Extract fixed‐effect coefs & var–cov matrix
+b <- unlist(fixef(mod2))          
+V_full <- as.matrix(vcov(mod2, full = TRUE))
+
+names(b) <- ifelse(
+  startsWith(names(b), "cond."),
+  sub("^cond\\.", "", names(b)),            # drop the "cond." prefix
+  sub("^disp\\.", "disp~", names(b))         # replace "disp." with "disp~"
+)
+
+# Make sure we have a one‐to‐one match, in order
+idx <- match(names(b), rownames(V_full))
+if (any(is.na(idx))) {
+  stop("These fixed‐effect names didn’t match any rownames(V_full):\n",
+       paste0("  ", names(b)[is.na(idx)], collapse="\n"))
+}
+
+V <- V_full[idx, idx] 
+
+# Build model matrices for mean & dispersion
+Xc    <- model.matrix( ~ 1 + pop*sex, sumdata)
+Xd    <- model.matrix( ~ 1 + pop*sex, sumdata)
+
+# Point estimates
+beta_c <- fixef(mod2)$cond
+beta_d <- fixef(mod2)$disp
+
+mu_hat  <- drop(exp( Xc %*% beta_c ))         # μ̂ₙ
+phi_hat <- drop(exp( Xd %*% beta_d ))         # φ̂ₙ
+sd_hat  <- sqrt(mu_hat + mu_hat^2/phi_hat)    # ŜDₙ
+
+# Parametric “bootstrap” from the joint Normal of (β_cond, β_disp)
+set.seed(101)
+nsim <- 2000
+b_sims <- mvrnorm(nsim, mu = b, Sigma = V)
+
+# split sims into conditional vs dispersion
+p_c <- length(beta_c)
+beta_c_sims <- b_sims[, 1:p_c, drop=FALSE]
+beta_d_sims <- b_sims[, (p_c+1):ncol(b_sims), drop=FALSE]
+
+# For each sim, compute sd for every row of newdata
+sd_sims <- array(NA, dim = c(nrow(sumdata), nsim))
+mu_sims <- array(NA, dim = c(nrow(sumdata), nsim))
+
+for(i in seq_len(nsim)) {
+  mu_i  <- exp( Xc %*% beta_c_sims[i, ] )
+  phi_i <- exp( Xd %*% beta_d_sims[i, ] )
+  mu_sims[, i] <- mu_i  
+  sd_sims[, i] <- sqrt( mu_i + mu_i^2/phi_i )
+}
+
+cv_sims <- sd_sims / mu_sims
+cv_hat  <- sd_hat / mu_hat
+
+# Summarize into point‐est + 95% CI
+cv_ci <- t(apply(cv_sims, 1, quantile, probs = c(0.025, 0.975)))
+
+cv_df <- sumdata %>%
+  mutate( cv       = cv_hat,
+          cv_lower   = cv_ci[,1],
+          cv_upper  = cv_ci[,2])
+
+# Combine mean and CV estimates:
+emm_mu_df <- as.data.frame(  
+  summary(emm_mu, infer = TRUE))
+
+emm_mu_df2 <- emm_mu_df %>%
+  dplyr::rename(
+    mu       = response,
+    mu_lower = `asymp.LCL`,
+    mu_upper = `asymp.UCL`
+  ) %>%
+  dplyr::select(
+    pop, sex,
+    mu, mu_lower, mu_upper
+  )
+est_mat <- emm_mu_df2 %>%
+  left_join(cv_df, by = c("pop","sex"))
+
+```
+
+```{r plots of estimates, echo = FALSE}
+
+#mean plot
+ggplot(est_mat, aes(x = sex, y = mu, color = pop)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = mu_lower, ymax = mu_upper),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated Mean of N by Group",
+    x = "Sex",
+    y = "Mean (μ)",
+    color = "Pop"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+#Note the very large CIs in sel - likely reflects the much larger block-wise variation in average N in sel. 
+
+#var plot
+
+ggplot(est_mat, aes(x = sex, y = cv, color = pop)) +
+  geom_point(size = 3, position = position_dodge(0.5)) +
+  geom_errorbar(aes(ymin = cv_lower, ymax = cv_upper),
+                width = 0.2, position = position_dodge(0.5)) +
+  labs(
+    title = "Estimated Total Variability (CV) of N by Group",
+    x = "Sex",
+    y = "Total CV = SD/Mean = sqrt(μ + μ² / ϕ)/μ",
+    color = "Selection"
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```

@@ -1,0 +1,1 @@
+Modelling differences in copulation success, latency (seconds) and duration (seconds) for male-female pairs from selected vs control populations. Video data were blindly scored to extract raw metrics used in the model.

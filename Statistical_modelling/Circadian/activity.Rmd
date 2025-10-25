@@ -1,0 +1,329 @@
+---
+title: "72-hour Circadian Activity for relaxed selected vs control populations"
+author: "slall"
+date: "2025-05-27"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,    # show code
+  warning = FALSE,
+  message = FALSE
+)
+knitr::opts_knit$set(root.dir = "E:/Selection/")
+
+options(contrasts = c("contr.treatment", "contr.poly"), digits = 3)
+
+library(glmmTMB)
+library(dplyr)
+library(emmeans)
+library(MASS)
+library(knitr)
+library(ggplot2)
+library(splines)
+library(nlme)
+
+```
+
+### Variables in imported data:
+
+ind_ID: individual ID
+
+selection: 2 evolutionary treatment groups, control and selected
+
+sex: 2 sexes
+
+block: 3 replicate lineages within each control group, that are blocked (VC1 and VS1 are one block, VC2 and VS2 are a second block etc..)
+
+relaxation: relaxation of selection, with and without family structure (within all lineages)
+
+date: start date of assay
+
+hour: ID of hour of measurement
+
+box: multiple behavioural boxes, with unique ids
+
+tray: unique ID of behavior tray used
+
+light: 0 if off, 1 if on
+
+response = activity: hourly activity for given hour for given individual in number of pixels moved
+
+
+```{r import + format data}
+df <- read.csv("analysis_by_assay/Circadian/activity_data.csv")
+
+df2 <- df %>%
+  # drop hours 21–32, then relabel so hour 33→1
+  filter(hour >= 33) %>%
+  mutate(hour = hour - 32) %>%
+  # now make day and hour_of_day run 1–24
+  mutate(
+    day = factor(floor((hour - 1) / 24) + 1),
+    hour_of_day = ((hour - 1) %% 24) + 1
+  )
+
+#This data is now subsetted from 9AM day 1 to 9AM day 3, with each 'day' with 24 hours going from 9AM to 9AM
+
+df2$ind_ID      <- factor(df2$ind_ID)
+df2$box         <- factor(df2$box)
+df2$tray        <- factor(df2$tray)
+df2$selection   <- factor(df2$selection, levels = c("con","sel"))
+df2$relaxation  <- factor(df2$relaxation, levels = c("fam","full"))
+df2$sex         <- factor(df2$sex,      levels = c("F","M"))
+df2$light       <- factor(df2$light)  
+df2$block       <- factor(df2$block)
+
+```
+
+
+```{r gls model for activity}
+gls_mod <- gls(activity ~ selection*sex*relaxation + 
+                 selection:block + 
+                 day + 
+                 ns(hour_of_day, df=4),
+               correlation = corAR1(form =~hour|ind_ID),
+               data=df2,
+               method = "REML")
+
+summary(gls_mod)
+
+emm1 <- emmeans(gls_mod, ~ selection*relaxation, weights = "equal", data = df2)
+
+summary(emm1)
+
+cont1 <- contrast(emm1,'revpairwise', by = 'relaxation')
+summary(cont1)
+
+plot(cont1)
+
+cont2 <- contrast(emm1,'revpairwise', by = 'selection')
+summary(cont2)
+plot(cont2)
+
+```
+
+**Takeaway**: Selection increases average activity across both relaxation regimes, but the effect is larger with full relax; relaxation itself is significant, sex is not significant, but there are significant interactions of relaxation with sex, and 3-way significant interaction of selection, sex and relaxation. There is also significant block-wise variation.
+
+The emmeans plot above marginalizes over sex, gives equal weights to all blocks, and plots the activity increase in selection wrt control for both relaxation regimes.
+
+Within selection regimes, full < fam for control, but full > fam for selection. Both significant when averaged over sex, block and day
+
+
+```{r visualizing model predictions}
+
+df2 <- df2 %>%
+  mutate(time = hour)
+
+emm_grid <- emmeans(
+  gls_mod, 
+  specs = ~ selection * sex * day * hour_of_day,
+  at    = list(
+    day         = c("1","2","3"),
+    hour_of_day = 1:24
+  ),
+  weights = "equal",
+  data    = df2
+)
+
+# turn into a data.frame and add a "time" variable from 1 to 72
+pred_df <- as.data.frame(emm_grid) %>%
+  mutate(
+    # day is a factor "1","2","3"; convert to 0,1,2 then *24
+    time = (as.numeric(day) - 1) * 24 + hour_of_day
+  )
+
+#randomize individual order for raw data plots
+set.seed(2025)
+df2 <- df2 %>%
+  mutate(ind_ID = factor(ind_ID, levels = sample(unique(ind_ID))))
+
+#Tag each row as “raw” or “pred” so we can give them independent colors:
+df2   <- df2   %>% mutate(sel_pred = paste0(selection, "_raw"))
+
+pred_df <- pred_df %>% mutate(sel_pred = paste0(selection, "_pred"))
+
+
+
+
+pal <- c(
+  con_raw  = "#D6B6DB", 
+  sel_raw  = "#9AD9D9",
+  con_pred = "#A733B2",    
+  sel_pred = "#00A1A1"    
+)
+
+p <- ggplot() +
+  # raw traces (one layer, honors the random Ind_ID order):
+  geom_line(
+    data    = df2,
+    aes(x = time, y = activity, group = ind_ID, color = sel_pred),
+    size    = 0.1,
+    alpha   = 0.1 
+  ) +
+  # # predicted ribbons:
+  # geom_ribbon(
+  #   data   = pred_df,
+  #   aes(x = time, ymin = lower.CL, ymax = upper.CL, fill = sel_pred),
+  #   alpha  = 0.5,
+  #   color  = NA
+  # ) +
+  # predicted mean curves:
+  geom_line(
+    data   = pred_df,
+    aes(x = time, y = emmean, color = sel_pred, linetype = sex),
+    size   = 1,
+    alpha  = 1
+  ) +
+  # apply our 4‐level palette to both color & fill:
+  scale_color_manual(values = pal, guide = "none") +
+  scale_fill_manual(values  = pal, guide = "none") +
+  scale_linetype_discrete(name = "Relaxation") +
+  # facet & axis scales:
+  #facet_grid(sex ~ .) +
+  #scale_x_continuous(breaks = seq(0, 72, by = 12)) +
+  labs(
+    x        = "Time since start (hours)",
+    y        = "Activity",
+    title    = "Raw individual traces (faint) + 72-h predicted curves",
+    subtitle = "con = magenta; sel = teal"
+  ) +
+  theme_minimal()
+
+p
+
+```
+
+# Log transformed
+
+```{r model as above but on log scale}
+# 1. Re-fit on the log scale
+
+gls_mod_log <- gls(
+  log(activity) ~ selection*sex*relaxation +
+    selection:block +
+    day +
+    ns(hour_of_day, df = 4),
+  correlation = corAR1(form = ~ hour| ind_ID),
+  data   = df2,
+  method = "REML"
+)
+
+summary(gls_mod_log)
+
+emm1 <- emmeans(gls_mod_log, ~ selection*relaxation, weights = "equal", data = df2, type = 'response')
+
+summary(emm1)
+
+cont1 <- contrast(emm1,'revpairwise', by = 'relaxation')
+summary(cont1)
+
+plot(cont1)
+
+cont2 <- contrast(emm1,'revpairwise', by = 'selection')
+summary(cont2)
+plot(cont2)
+```
+
+
+```{r visualizing log model predictions}
+
+df2 <- df2 %>%
+  mutate(time = hour)
+
+emm_grid <- emmeans(
+  gls_mod_log, 
+  specs = ~ selection * sex * day * hour_of_day,
+  at    = list(
+    day         = c("1","2","3"),
+    hour_of_day = 1:24
+  ),
+  weights = "equal",
+  type = 'response',
+  data    = df2
+)
+
+# turn into a data.frame and add a "time" variable from 1 to 72
+pred_df <- as.data.frame(emm_grid) %>%
+  mutate(
+    # day is a factor "1","2","3"; convert to 0,1,2 then *24
+    time = (as.numeric(day) - 1) * 24 + hour_of_day
+  )
+
+#randomize individual order for raw data plots
+set.seed(2058)
+df2 <- df2 %>%
+  mutate(ind_ID = factor(ind_ID, levels = sample(unique(ind_ID))))
+
+#Tag each row as “raw” or “pred” so we can give them independent colors:
+df2   <- df2   %>% mutate(sel_pred = paste0(selection, "_raw"))
+
+pred_df <- pred_df %>% mutate(sel_pred = paste0(selection, "_pred"))
+
+
+pal <- c(
+  con_raw  = "#D6B6DB", 
+  sel_raw  = "#9AD9D9",
+  con_pred = "#A733B2",    
+  sel_pred = "#00A1A1"    
+)
+
+ggplot() +
+  # raw traces (one layer, honors the random Ind_ID order):
+  geom_line(
+    data    = df2,
+    aes(x = time, y = activity, group = ind_ID, color = sel_pred),
+    size    = 0.1,
+    alpha   = 0.1 
+  ) +
+  # predicted mean curves:
+  geom_line(
+    data   = pred_df,
+    aes(x = time, y = response, color = sel_pred, linetype = sex),
+    size   = 0.25,
+    alpha  = 1
+  ) +
+  # apply our 4‐level palette to both color & fill:
+  scale_color_manual(values = pal, guide = "none") +
+  scale_fill_manual(values  = pal, guide = "none") +
+  scale_linetype_discrete(name = "Sex") +
+  scale_x_continuous(breaks = seq(0, 72, by = 12)) +
+  labs(
+    x        = "Time since start (hours)",
+    y        = "Activity",
+    title    = "Raw individual traces (faint) + 72-h predicted curves",
+    subtitle = "con = magenta; sel = teal"
+  ) +
+theme_classic() +
+
+theme(
+  panel.background = element_rect(fill = "transparent", colour = NA),
+  plot.background  = element_rect(fill = "transparent", colour = NA),  
+  panel.border = element_rect(              # draw a rectangle around the panel
+      colour = "black",
+      fill   = NA,                            # don’t fill it
+      linewidth   = 1)                              # thickness
+    )
+    
+ggsave("analysis_by_assay/Circadian/MF_act.pdf",width = 6, height = 3, bg ='transparent')
+
+
+```
+
+```{r model for average activity}
+
+#not able to get this to converge. It takes super long. I'm going to stick with gls for this one
+mod1 <- glmmTMB(
+  activity ~ selection*sex*relaxation + light
+           + (1 | ind_ID)             # random intercept for each fly
+           + (1 | block)              # or use block as fixed if you prefer
+           + (1 | box) + (1 | date) + (1 | tray)
+           + ar1(factor(hour) +0  | ind_ID),
+  family    = gaussian(),
+  data      = df,
+  REML      = FALSE,
+  control   = glmmTMBControl(optCtrl = list(iter.max=100, eval.max=100))
+)
+summary(mod1)
+```

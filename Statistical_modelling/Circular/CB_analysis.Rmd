@@ -1,0 +1,163 @@
+---
+title: "Circ_Bias"
+author: "slall"
+date: "2025-05-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,    # show code
+  warning = FALSE,
+  message = FALSE
+)
+knitr::opts_knit$set(root.dir = "E:/Selection/")
+
+options(contrasts = c("contr.treatment", "contr.poly"), digits = 3)
+
+library(glmmTMB)
+library(dplyr)
+library(emmeans)
+library(MASS)
+library(knitr)
+library(ggplot2)
+
+```
+
+### Variables in imported data:
+
+selection: 2 evolutionary treatment groups, control and selected
+
+sex: 2 sexes
+
+block: 3 replicate lineages within each control group, that are blocked (VC1 and VS1 are one block, VC2 and VS2 are a second block etc..)
+
+relax: relaxation of selection, with and without family structure (within all lineages)
+
+family: 0 if full relax, corresponding family from block if fam relax.
+
+(*Note, family '1' in block 1 selection has nothing to do with family '1' in block 2 selection or in block 1 control*)
+
+day: multiple days of measurement, incomplete balanced blocking in general (Here: 7 days)
+
+box: multiple behavioural boxes, with unique ids. 4 boxes.
+
+experimenter: multiple experimenters with unique names. (Here: 2 experimenters)
+
+tray: unique ID of behavior tray used (Here: 1 to 10)
+
+arena_pos: position of behavior arena within the tray (Here: 1 to 64)
+
+unit of sampling is individual fly (i.e. you have unique, and INDEPENDENT measures of your response variables per fly.)
+
+response = circ_bias - values between -1 and 1, large peak at zero, looks normal-ish
+
+Insights from visualization - means similar across blocks and populations; variability in circling bias higher in selected vs control in block 1, mild differences in 2 & 3
+
+```{r import + format data}
+df <- read.csv("analysis_by_assay/Circular/circ_bias_data.csv")
+```
+
+```{r model for variability in CB}
+mod1 <- glmmTMB( circ_bias ~ 1 + selection*sex*relaxation,
+                 dispformula = ~1 + selection*sex*relaxation + 
+                   diag(0 + selection|block) + diag(0 + relaxation | selection:block) 
+                  + (1 | box) + (1|day) + (1|experimenter) + (1|tray) + (1|arena_pos), 
+                 family = gaussian(link = "identity"),
+                 data = df, REML = FALSE)
+
+summary(mod1)
+```
+
+Selection is non-significant, interactions as well. Sex and relaxation are marginally significant.
+
+Next, we can compare emmeans for groups for dispersion. With a Gaussian family, dispersion estimates are for variance, and therefore we can directly use the sqrt of estimated dispersion as variability (sd).
+
+```{r emmeans estimations}
+
+emm1 = emmeans(mod1, ~selection*sex*relaxation, component = 'disp', type = 'response', infer = TRUE)
+
+emm2 = emmeans(mod1, ~selection*sex, component = 'disp', type = 'response', infer = TRUE)
+
+summary(emm2)
+summary(emm1)
+
+est_mat <- as.data.frame(summary(emm1))
+est_mat_2 <- as.data.frame(summary(emm2))
+
+emm_pair = contrast(emm1, by = c('relaxation','sex'),'revpairwise')
+emm_pair
+plot(emm_pair)
+```
+
+```{r plotting to visualize dispersion}
+est_mat$group <- interaction(est_mat$sex, est_mat$relaxation, sep = " × ")
+
+ggplot(est_mat, aes(x = group, y = sqrt(response), color = selection)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbar(aes(ymin = sqrt(lower.CL), ymax = sqrt(upper.CL)), width = 0.2, position = position_dodge(width = 0.4)) +
+  labs(
+    title = "Predicted Variability in Circling Bias by Group (with 95% CIs)",
+    x = "Sex × Relaxation",
+    y = "Estimated Variability (sd)",
+    color = "Selection",
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+```{r plotting without relaxation}
+
+ggplot(est_mat_2, aes(x = sex, y = sqrt(response), color = selection)) +
+  geom_point(size = 3, position = position_dodge(width = 0.4)) +
+  geom_errorbar(aes(ymin = sqrt(lower.CL), ymax = sqrt(upper.CL)), width = 0.2, position = position_dodge(width = 0.4)) +
+   scale_color_manual(values = c(
+    con = "#A733B2",
+    sel = "#00A1A1"
+  )) +labs(
+    title = "Predicted Variability in Circling Bias by Group (with 95% CIs)",
+    x = "Sex",
+    y = "Estimated Variability (sd)",
+    color = "Selection",
+  ) +
+theme_classic() +
+  theme(
+    panel.background = element_rect(fill = "transparent", colour = NA),
+    plot.background  = element_rect(fill = "transparent", colour = NA),  
+    panel.border = element_rect(              # draw a rectangle around the panel
+      colour = "black",
+      fill   = NA,                            # don’t fill it
+      linewidth   = 1)                              # thickness
+  )
+
+ggsave("analysis_by_assay/Circular/MF_circ.pdf",width = 6, height = 4, bg ='transparent')
+```
+
+While sel > con for all groups, it is not statistically significant (marginally significant in M_full). However, the trend does align with expectations.
+
+### Levene transform
+
+```{r levene transformed CB}
+df <- df %>%
+  group_by(selection, sex, block, relaxation) %>%
+  mutate(
+    median_CB   = median(circ_bias, na.rm = TRUE),
+    levene_stat = abs(circ_bias - median_CB)
+  ) %>%
+  ungroup()
+
+# Levene stat is now a positively decreasing function with a peak at 0. We'll use the same approach as TB, add a small value to all data, and use a Gamma family with log link. 
+
+df$levene_adj <- df$levene_stat + 1e-6
+
+mod_lev = glmmTMB(levene_adj ~ 1 + (selection*sex*relaxation) + 
+                   diag(0 + selection|block) + diag(0 + relaxation | selection:block) 
+                 + (1 | box)+ (1|tray) + (1|day),
+                 family = Gamma(link = "log"),
+                 ziformula = ~1,
+                 data = df)
+
+summary(mod_lev)
+```
+
+The takeaways are the same-ish. Sex goes from marginally significant to just significant, relaxation is marginal, selection is ns. 

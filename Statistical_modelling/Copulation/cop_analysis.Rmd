@@ -1,0 +1,341 @@
+---
+title: "Differences in copulation success, latency and duration in selected vs control populations"
+author: "slall"
+date: "2025-05-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,    # show code
+  warning = FALSE,
+  message = FALSE
+)
+knitr::opts_knit$set(root.dir = "E:/Selection/")
+
+options(contrasts = c("contr.treatment", "contr.poly"), digits = 3)
+
+library(glmmTMB)
+library(dplyr)
+library(emmeans)
+library(MASS)
+library(knitr)
+library(ggplot2)
+
+```
+
+### Variables in imported data:
+
+selection: 2 evolutionary treatment groups, control and selected
+
+block: 3 replicate lineages within each control group, that are blocked (VC1 and VS1 are one block, VC2 and VS2 are a second block etc..)
+
+relaxation: 2 types of relaxation of selection, with and without family structure (within all lineages)
+
+arena_pos: position of behavior arena within the tray (Here: 1 to 64)
+
+box: ID of behavior box (1 to 4)
+
+tray: ID of behavior tray (1 to 10)
+
+day: day assay was conducted (1 to 5)
+
+family: 0 if full relax, corresponding family from block if fam relax.
+
+(*Note, family '1' in block 1 selection has nothing to do with family '1' in block 2 selection or in block 1 control*)
+
+unit of sampling is individual fly (i.e. you have unique, and INDEPENDENT measures of your response variables per fly.)
+
+response 1 = cop_lat (cop_lat_dur.csv): copulation latency in seconds continuous data, \>0, peak near 0 and then drop, looks exponential
+
+response 2 = cop_dur (cop_lat_dur.csv): copulation duration in seconds, looks normal-ish
+
+response 3 = success (cop_success.csv): 1 or 0 for success or failure to copulate. Only successful pairs used for response 1 & 2
+
+### Copulation Success
+
+```{r import success data}
+df <- read.csv("analysis_by_assay/Copulation/cop_success.csv")
+```
+
+Copulation success is binary 0/1 - model with binomial
+
+```{r glmmmTMB model for success}
+mod1 <- glmmTMB(success ~ 1 + selection*relaxation + 
+                  diag(0 + selection | block ) + 
+                  diag( 0 + relaxation | selection:block) + 
+                  (1 | box) + (1|tray) + (1|day),
+                family = binomial(link = "logit"),
+                data = df, REML = FALSE)
+summary(mod1)
+```
+
+Selection significantly impacts copulation success, reducing probability of successful copulation.
+
+```{r emmeans for success}
+emm1 = emmeans(mod1,~selection,type='response')
+
+cont1 = contrast(emm1, 'revpairwise')
+
+plot(cont1)+
+  geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('Ratio of probabilities of successful copulation') +
+  theme_bw()
+```
+
+```{r plotting success, echo = FALSE}
+emm1_df <- as.data.frame(emm1)
+
+
+
+raw_cols  <- c(con = "#D6B6DB", sel = "#9AD9D9")  # for raw jitter
+est_cols  <- c(con = "#A733B2", sel = "#00A1A1")  # for estimates
+
+ggplot() +
+  # 1) Jittered raw data: no legend entry
+  geom_jitter(
+    data    = df,
+    aes(x = selection, y = success),
+    color   = raw_cols[df$selection],
+    shape   = 19,
+    size    = 2,
+    alpha   = 0.25,
+    width   = 0.4,
+    height  = 0.0,
+    show.legend = FALSE
+  ) +
+  # 2) Model‐estimate error bars:
+  geom_errorbar(
+    data    = emm1_df,
+    aes(x = selection, ymin = asymp.LCL, ymax = asymp.UCL, color = selection),
+    width   = 0.1
+  ) +
+  # 3) Model‐estimate points:
+  geom_point(
+    data    = emm1_df,
+    aes(x = selection, y = prob, fill = selection),
+    size    = 3,
+    shape = 21,
+    color = 'black'
+  ) +
+  # 4) Two separate manual scales:
+  scale_fill_manual(
+    name   = "Selection Group",
+    values = est_cols
+  ) +
+  scale_color_manual(
+    name   = "Selection Group",
+    values = est_cols
+  ) +
+theme_classic() +
+
+theme(
+  panel.background = element_rect(fill = "transparent", colour = NA),
+  plot.background  = element_rect(fill = "transparent", colour = NA),  
+  panel.border = element_rect(              # draw a rectangle around the panel
+      colour = "black",
+      fill   = NA,                            # don’t fill it
+      linewidth   = 1)                              # thickness
+    )
+    
+ggsave("analysis_by_assay/Copulation/cop_suc.pdf",width = 6, height = 4, bg ='transparent')
+    
+```
+
+**Takeaway: Selection reduces copulation success** 
+
+### Copulation Latency
+
+The following two analyses are only for those pairs that copulated successfully. 
+
+```{r import latency + duration data}
+df <- read.csv("analysis_by_assay/Copulation/cop_lat_dur.csv")
+```
+Dispersion in copulation latency does not differ across groups. So the model only focuses on the mean.
+
+Since it is a positively valued integer, we will model latency with a Gamma family
+
+```{r modelling cop lat}
+mod2 <- glmmTMB(cop_lat ~ 1 + selection*relaxation + 
+                   diag(0 + selection | block ) + 
+                   diag( 0 + relaxation | selection:block) + 
+                   (1 | box) + (1|tray) + (1|day)+ (1|arena_pos),
+                 family = Gamma(link = "log"),
+                 data = df, REML = FALSE)
+summary(mod2)
+```
+
+Selection is marginally significant, with copulation latency in sel > con
+
+```{r emmeans on latency}
+emm2 = emmeans(mod2,~selection,type='response')
+
+emm2_df <- as.data.frame(emm2)
+
+cont2 = contrast(emm2, 'revpairwise')
+plot(cont2)+
+  geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('Ratio of copulation latency') +
+  theme_bw()
+```
+
+
+```{r plotting latency, echo = FALSE}
+emm2_df <- as.data.frame(emm2)
+
+raw_cols  <- c(con = "#D6B6DB", sel = "#9AD9D9")  # for raw jitter
+est_cols  <- c(con = "#A733B2", sel = "#00A1A1")  # for estimates
+
+ggplot() +
+  # 1) Jittered raw data: use fill + shape 16, no legend entry
+  geom_jitter(
+    data    = df,
+    aes(x = selection, y = cop_lat),
+    color   = raw_cols[df$selection],
+    shape   = 19,
+    size    = 2,
+    alpha   = 0.25,
+    width   = 0.15,
+    height  = 0.0,
+    show.legend = FALSE
+  ) +
+  # 2) Model‐estimate error bars:
+  geom_errorbar(
+    data    = emm2_df,
+    aes(x = selection, ymin = asymp.LCL, ymax = asymp.UCL, color = selection),
+    width   = 0.1
+  ) +
+  # 3) Model‐estimate points:
+  geom_point(
+    data    = emm2_df,
+    aes(x = selection, y = response, fill = selection),
+    size    = 3,
+    shape = 21,
+    color = 'black'
+  ) +
+  # 4) Two separate manual scales:
+  scale_fill_manual(
+    name   = "Selection Group",
+    values = est_cols
+  ) +
+  scale_color_manual(
+    name   = "Selection Group",
+    values = est_cols
+  ) +
+theme_classic() +
+
+theme(
+  panel.background = element_rect(fill = "transparent", colour = NA),
+  plot.background  = element_rect(fill = "transparent", colour = NA),  
+  panel.border = element_rect(              # draw a rectangle around the panel
+      colour = "black",
+      fill   = NA,                            # don’t fill it
+      linewidth   = 1)                              # thickness
+    )
+
+    
+ggsave("analysis_by_assay/Copulation/cop_lat.pdf",width = 6, height = 4, bg ='transparent')
+
+```
+
+**Takeaway: Selection increases copulation latency, but the effect is not very large***
+
+###Copulation Duration
+
+As for latency, the dispersion was not different. Mean model is used below:
+
+```{r model for cop dur}
+mod3 <- glmmTMB(cop_dur ~ 1 + selection*relaxation + 
+                  diag(0 + selection | block ) + 
+                  diag( 0 + relaxation | selection:block) + 
+                  (1 | box) + (1|tray) + (1|day)+ (1|arena_pos),
+                family = Gamma(link = "log"),
+                data = df, REML = FALSE)
+summary(mod3)
+```
+
+Copulation duration is not impacted by selection. We can use emmeans to get estimates and plot mean copulation duration. 
+
+```{r emmeans on duration}
+emm3 = emmeans(mod3,~selection,type='response')
+
+emm3_df <- as.data.frame(emm3)
+
+cont3 = contrast(emm3, 'revpairwise')
+
+plot(cont3)+
+  geom_vline(xintercept = 1, lty = 2, alpha = 0.5) +
+  xlab('Ratio of copulation duration') +
+  theme_bw()
+```
+
+
+```{r plotting duration, echo = FALSE}
+
+emm3_df <- as.data.frame(emm3)
+
+raw_cols  <- c(con = "#D6B6DB", sel = "#9AD9D9")  # for raw jitter
+est_cols  <- c(con = "#A733B2", sel = "#00A1A1")  # for estimates
+
+ggplot() +
+  # 1) Jittered raw data: no legend entry
+  geom_jitter(
+    data    = df,
+    aes(x = selection, y = cop_dur),
+    color   = raw_cols[df$selection],
+    shape   = 19,
+    size    = 2,
+    alpha   = 0.25,
+    width   = 0.15,
+    height  = 0.0,
+    show.legend = FALSE
+  ) +
+  # 2) Model‐estimate error bars:
+  geom_errorbar(
+    data    = emm3_df,
+    aes(x = selection, ymin = asymp.LCL, ymax = asymp.UCL, color = selection),
+    width   = 0.1
+  ) +
+  # 3) Model‐estimate points:
+  geom_point(
+    data    = emm3_df,
+    aes(x = selection, y = response, fill = selection),
+    size    = 3,
+    shape = 21,
+    color = 'black'
+  ) +
+  # 4) Two separate manual scales:
+  scale_fill_manual(
+    name   = "Selection Group",
+    values = est_cols
+  ) +
+  scale_color_manual(
+    name   = "Selection Group",
+    values = est_cols
+  ) +
+  labs(x     = "Population",
+       y     = "Copulation Duration (s)",
+       shape = "Sex") +
+  # Custom x-axis labels
+  scale_x_discrete(labels = c(
+    'sel' = 'Selection',
+    'con'   = 'Control'
+  )) +
+theme_classic() +
+theme(
+  panel.background = element_rect(fill = "transparent", colour = NA),
+  plot.background  = element_rect(fill = "transparent", colour = NA),  
+  panel.border = element_rect(              # draw a rectangle around the panel
+      colour = "black",
+      fill   = NA,                            # don’t fill it
+      linewidth   = 1),                              # thickness
+  legend.position = "none",
+  axis.title.x = element_text(margin = margin(t = 10)),  # top margin for x-axis title
+  axis.title.y = element_text(margin = margin(r = 15))   # right margin for y-axis title
+)
+  
+ggsave("analysis_by_assay/Copulation/cop_dur_supp6.pdf",width = 6, height = 4, bg ='transparent')
+
+
+
+```

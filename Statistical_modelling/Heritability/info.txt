@@ -1,0 +1,1 @@
+Calculating realized heritability over 21 generations of selection./ Order of scripts is matlab --> python --> R
